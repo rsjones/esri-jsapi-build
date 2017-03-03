@@ -1,0 +1,38 @@
+{
+  "name": "esri-jsapi-build",
+  "version": "0.0.1",
+  "description": "Build ESRI ArcGIS API for JavaScript applications for performance.",
+  "main": "bin/main",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rsjones/esri-jsapi-build.git"
+  },
+  "keywords": [
+    "Esri",
+    "ArcGIS",
+    "JSAPI",
+    "JavaScript",
+    "API",
+    "Build",
+    "Production"
+  ],
+  "author": {
+    "name": "Randy Jones",
+    "email": "randy_jones@esri.com"
+  },
+  "license": "Apache 2.0",
+  "bugs": {
+    "url": "https://github.com/rsjones/esri-jsapi-build/issues"
+  },
+  "homepage": "https://github.com/rsjones/esri-jsapi-build",
+  "dependencies": {
+    "bluebird": "^3.4.7",
+    "fs-extra": "^2.0.0",
+    "replace-in-file": "^2.4.0",
+    "requirejs": "^2.3.3",
+    "rimraf": "^2.6.1"
+  }
+}

@@ -1,0 +1,354 @@
+#!/usr/bin/env node
+
+// require built-in node packages needed for Usage test
+const process = require('process');
+const util = require('util');
+
+const validCommands = [{
+		name: 'init',
+		desc: 'Create a build profile via command propmts'
+	}, {
+		name: 'build',
+		desc: 'Run a build'
+	}, {
+		name: 'clean',
+		desc: 'Deletes all folders created by the build'
+	}
+];
+
+// Options are prefixed with -- on the command line
+const validOptions = [{
+		name: 'src',
+		desc: 'Path to the apps web folder, default is .'
+	}, {
+		name:'profile',
+		desc: 'Location of profile file, default is ./app.profile.js'
+	},{
+		name: 'buildDir',
+		desc: 'Temp folder name to make build in. default: build-src'
+	}, {
+		name:'dist',
+		desc: 'Build output folder name'
+	}, {
+		name:'indexFile',
+		desc: 'Index file, if specified it will replace the jsapi url include with dojo/dojo.js, delete the content between comments // DELETE FROM HERE ... // DELETE TO HERE and set dojo isDebug to false'
+	}
+];
+
+var commandArr = [];
+var optionsArr = [];
+var usage = [];
+var usageInit = false;
+
+const initUsage = () => {
+	usageInit = true;
+	usage.push('')
+	usage.push('');
+	usage.push('Commands:');
+	validCommands.forEach((command) => {
+		commandArr.push(command.name);
+		usage.push(util.format('    %s   %s', command.name, command.desc));
+	});
+	usage.push('');
+	validOptions.forEach((command) => {
+		optionsArr.push(command.name);
+		usage.push(util.format('    %s   %s', '--' + command.name, command.desc));
+	});
+	usage[0] = 'Usage: esri-jaspi-build <command> [--' + optionsArr.join(' <path>] [--') + ' <path>]';
+};
+
+const usageAndExit = (error) => {
+	if (!usageInit) {
+		initUsage();
+	}
+	console.error('');
+	if (error) {
+		console.error('***ERROR: ' + error);
+		console.error('');
+	}
+
+	usage.forEach((line) => {
+		console.error(line);
+	});
+	process.exit(1);
+};
+
+if (process.argv.length < 3) {
+	usageAndExit();
+}
+
+initUsage();
+
+// remove the node and main file from the argv
+var args = process.argv.slice(2);
+var command = null;
+var options = {
+	src: null,
+	profile: "app.profile.js",
+	buildDir: "build-src",
+	dist: "dist",
+	indexFile: null
+};
+
+// parse the command line arguments & validate
+args.forEach(function(arg, idx){
+
+	//collection all the options into an object
+	if (arg.indexOf('--') == 0) {
+		var argName = arg.replace("--", "")
+		if (optionsArr.indexOf(argName) >= 0) {
+			// validate that there is a option specified
+			if (args[idx+1]) {
+				options[argName] = args.splice(idx+1, 1)[0];
+			} else {
+				usageAndExit(arg + ' must have value specified.');
+			}
+		} else {
+			usageAndExit(arg + ' is an invalid option');
+		}
+	} else if (command == null) {
+		// if not an option assume its a command and validate
+		command = arg;
+		if (commandArr.indexOf(command) === -1){
+			usageAndExit(command + ' is not a valid command.');
+		}
+	} else {
+		usageAndExit('invalid usage');
+	}
+});
+
+// Passed usage checks start module logic
+
+// require built-in node packages
+const path = require('path');
+const exec = require('child_process').exec;
+const vm = require('vm');
+
+// require external packages
+const Promise = require('bluebird');
+const fs = Promise.promisifyAll(require('fs-extra'));
+const rimraf = Promise.promisify(require('rimraf'));
+const replace = require('replace-in-file');
+
+// variables for the app src and build folder so we don't 
+const appRoot = options.src == null ? process.cwd() : path.join(process.cwd(), options.src);
+const buildRoot = path.join(process.cwd(), options.buildDir);
+const distRoot = path.join(process.cwd(), options.dist);
+
+/**
+ * Helper function to wrap exec as a promise
+ * @param  {[type]} child [description]
+ * @return {[type]}       [description]
+ */
+var promiseFromExec = (child) => {
+    return new Promise((resolve, reject) => {
+        child.addListener("error", reject);
+        child.addListener("exit", (code, signal) => { if (code === 0) { resolve(); } else { reject(); } });
+    });
+};
+
+var clean = (folder) => {
+	return rimraf(folder);
+};
+
+var preBuild = (appDir, buildDir) => {
+	var resolveDfd = null;
+	var rejectDfd = null;
+	var dfd = new Promise((resolve, reject) => {
+		resolveDfd = resolve;
+		rejectDfd = reject;
+	});
+	// make the build folder so the original src isn't dirtied
+	fs.mkdirAsync(buildDir).then(() => {
+		var copies = [];
+		// copy bower files to add jsapi dependencies
+		copies.push(fs.copyAsync(path.join(__dirname,"bower.json"),path.join(buildDir,"bower.json")));
+		copies.push(fs.copyAsync(path.join(__dirname,".bowerrc"),path.join(buildDir,".bowerrc")));
+		
+		// install jsapi dependencies via bower
+		console.log("Installing dependencies via bower");
+		const syncArgs = {cwd:buildDir,stdio:[0,1,2]};
+		copies.push(promiseFromExec(exec("bower install",syncArgs)));
+
+		//copy app files to the build folder
+		console.log("Copying app files to " + buildDir);
+		fs.readdirAsync(appDir).then(function(files){
+			files.forEach((file) => {
+				copies.push(fs.copyAsync(path.join(appDir,file),path.join(buildDir,file)));
+			});
+			
+			//wait for all files to be copied and dependencies downloaded
+			Promise.all(copies).then(() => {
+				resolveDfd();
+			}).catch(() => {
+				rejectDfd();
+			});
+		});
+	});
+
+	return dfd;
+};
+
+var build = (buildDir) => {
+	var loadModule = "build";
+
+	// this dojoConfig is for dojo's build system, not the app configuration
+	// which is in the build profile
+	dojoConfig = {
+	  baseUrl: buildDir, // Where we will put our packages
+	  async: 1, // We want to make sure we are using the "modern" loader
+	  hasCache: {
+	    "host-node": 1, // Ensure we "force" the loader into Node.js mode
+	    "dom": 0 // Ensure that none of the code assumes we have a DOM
+	  },
+	  // While it is possible to use config-tlmSiblingOfDojo to tell the
+	  // loader that your packages share the same root path as the loader,
+	  // this really isn't always a good idea and it is better to be
+	  // explicit about our package map.
+	  packages: [{
+	    name: "dojo",
+	    location: path.join(buildDir,"dojo")
+	  }, 
+	  {
+	    name: "build",
+	    location: path.join(buildDir,"util/build")
+	  }],
+	  deps: [loadModule] // And array of modules to load on "boot"
+	};
+
+	console.log('copy build profile');
+	fs.copySync(options.profile, path.join(buildDir, path.basename(options.profile)));
+
+	console.log("Running dojo build");
+	var syncArgs = {cwd:buildDir,stdio:[0,1,2]};
+	return promiseFromExec(exec("node " + 'dojo\\dojo.js' + " load=build profile=buildProject.profile.js -v",syncArgs));
+};
+
+var postBuild = (buildSrc, buildDir, distDir) => {
+	var resolveDfd = null;
+	var rejectDfd = null;
+	var dfd = new Promise((resolve, reject) => {
+		resolveDfd = resolve;
+		rejectDfd = reject;
+	});
+
+	// load the profile so we can copy layers and misc packages to dist
+	// var profile = { //dojo build profile }
+	// Dojo doc on profile http://dojotoolkit.org/reference-guide/1.10/build/buildSystem.html#profile-basics
+	// Profile Examples:
+	//       https://github.com/Esri/jsapi-resources/blob/master/3.x/bower/dojo/build.profile.js
+	//       https://github.com/Esri/enterprise-build-sample-js/blob/master/build/buildProject.profile.js
+	var content = fs.readFileSync(options.profile);
+	vm.runInThisContext(content);
+
+	// copy all layer files specified in profile to dist
+	console.log("Copying layer files from build to " + distDir);
+	Object.keys(profile.layers).forEach((layer) => {
+		var layerFile = path.sep + layer.split("/").join(path.sep) + ".js";
+		fs.copySync(buildDir + layerFile, distDir + layerFile);
+	});
+
+	// build copy ignore list by examining profile's packages, add the dojo
+	// util by default, which is what contains the dojo build system
+	var ignoreList = ['util', 'bower.json', '.bowerrc'];
+	profile.packages.forEach((package) => {
+		var location = package.location;
+		location = location.replace("./", "");
+		location = location.split("/")[0];
+		ignoreList.push(location);
+	});
+
+	console.log(ignoreList);
+
+	//copy app files to the build folder
+	console.log("Copying app files to " + distDir);
+	var resolveCopyDfd = null;
+	var rejectCopyDfd = null;
+	var copyDfd = new Promise((resolve, reject) => {
+		resolveCopyDfd = resolve;
+		rejectCopyDfd = reject;
+	});
+	fs.readdirAsync(buildSrc).then(function(files){
+		var copies = [];
+		files.forEach((file) => {
+			if (ignoreList.indexOf(file) == -1) {
+				copies.push(fs.copyAsync(path.join(buildSrc,file),path.join(distDir,file)));
+			}
+		});
+		
+		//wait for all files to be copied and dependencies downloaded
+		Promise.all(copies).then(() => {
+			resolveCopyDfd();
+		}).catch(() => {
+			rejectCopyDfd();
+		});
+	});
+
+	if (options.indexFile) {
+		console.log("indexFile set", options.indexFile);
+		copyDfd.then(() => {
+			var repOptions = {
+				files: path.join(distDir, options.indexFile),
+				from: [
+					/\/\/js.arcgis.com\/3.19\/"/g, //#1
+					/\/\/ DELETE FROM HERE[\s\S]*\/\/ TO HERE/, //#2
+					/isDebug[\s]*:[\s]*true/ //#3
+				], 
+				to: [
+					'dojo/dojo.js"',
+					'',
+					'isDebug: false'
+				]
+			};
+
+			replace(repOptions).then(changedFiles => {
+				resolveDfd();
+			});
+		});
+	} else {
+		resolveDfd();
+	}
+
+	return dfd;
+};
+
+if (command == 'build') {
+
+	// clean up old build, if exists
+	Promise.all([
+		clean(buildRoot),
+		clean("buildOutput"),
+		clean(distRoot)
+	]).then(() => {
+		preBuild(appRoot, buildRoot).then(function(){
+			console.log("copied");
+			build(buildRoot).then( () => {
+				postBuild(buildRoot, "buildOutput", distRoot).then( () => {
+					Promise.all([
+						clean(buildRoot),
+						clean("buildOutput")
+					]).then(() => {
+						console.log("Build complete.");
+					}).catch((err) => {
+						console.error("Error cleaning up temp build folders", err);
+					});
+				});
+			});
+			
+		}); // end Promise
+	});
+
+} else if (command == 'clean') {
+
+	// clean up old build, if exists
+	Promise.all([
+		clean(buildRoot),
+		clean("buildOutput"),
+		clean(distRoot)
+	]).then(() => {
+		console.log("clean complete")
+	});
+
+} else {
+	postBuild(buildRoot, distRoot);
+}
